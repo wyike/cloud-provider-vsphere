@@ -340,6 +340,17 @@ update-codegen:
 verify-codegen:
 	hack/verify-codegen.sh
 
+
+CONTROLLER_GEN = $(TOOLS_BIN_DIR)/controller-gen
+.PHONY: controller-gen
+controller-gen: ## Download controller-gen locally if necessary.
+	$(call go-get-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen@v0.13.0)
+
+
+.PHONY: generate
+generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
+	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./pkg/cloudprovider/vsphereparavirtual/apis"
+
 ################################################################################
 ##                                  HELPERS                                  ##
 ################################################################################
@@ -353,3 +364,16 @@ docker-image:
 	-f cluster/images/controller-manager/Dockerfile \
 	-t "$(IMAGE):$(BRANCH_NAME)" \
 	--build-arg "VERSION=${VERSION}" . \
+
+# go-get-tool will 'go get' any package $2 and install it to $1.
+define go-get-tool
+@[ -f $(1) ] || { \
+set -e ;\
+TMP_DIR=$$(mktemp -d) ;\
+cd $$TMP_DIR ;\
+go mod init tmp ;\
+echo "Downloading $(2)" ;\
+GOBIN=$(TOOLS_BIN_DIR) go install $(2) ;\
+rm -rf $$TMP_DIR ;\
+}
+endef

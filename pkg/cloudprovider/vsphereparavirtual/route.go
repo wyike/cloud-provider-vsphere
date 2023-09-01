@@ -19,25 +19,17 @@ package vsphereparavirtual
 import (
 	"context"
 	"fmt"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/route"
 	"net"
-	"strings"
+	"sync"
 	"time"
 
-	"sync"
-
-	"github.com/pkg/errors"
-
 	v1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes/scheme"
-
 	rest "k8s.io/client-go/rest"
 	cloudprovider "k8s.io/cloud-provider"
-	v1alpha1 "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/apis/nsxnetworking/v1alpha1"
-	client "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/client/clientset/versioned"
+	routecommon "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/route"
 	"k8s.io/cloud-provider-vsphere/pkg/util"
 	klog "k8s.io/klog/v2"
 )
@@ -50,58 +42,23 @@ type RoutesProvider interface {
 }
 
 type routesProvider struct {
-	routeClient client.Interface
-	namespace   string
-	nodeMap     map[string]*v1.Node
-	nodeMapLock sync.RWMutex
-	ownerRefs   []metav1.OwnerReference
+	routeManager route.RouteManager
+	nodeMap      map[string]*v1.Node
+	nodeMapLock  sync.RWMutex
 }
 
 var _ RoutesProvider = &routesProvider{}
 
-const (
-	// LabelKeyClusterName is the label key to specify GC name for RouteSet CR
-	LabelKeyClusterName = "clusterName"
-	// RealizedStateTimeout is the timeout duration for realized state check
-	RealizedStateTimeout = 10 * time.Second
-	// RealizedStateSleepTime is the interval between realized state check
-	RealizedStateSleepTime = 1 * time.Second
-)
-
-// A list of possible RouteSet operation error messages
-var (
-	ErrGetRouteSet    = errors.New("failed to get RouteSet")
-	ErrCreateRouteSet = errors.New("failed to create RouteSet")
-	ErrListRouteSet   = errors.New("failed to list RouteSet")
-	ErrDeleteRouteSet = errors.New("failed to delete RouteSet")
-)
-
-// GetRouteSetClient returns a new RouteSet client that can be used to access SC
-func GetRouteSetClient(config *rest.Config) (client.Interface, error) {
-	v1alpha1.AddToScheme(scheme.Scheme)
-	rClient, err := client.NewForConfig(config)
-	if err != nil {
-		klog.V(6).Infof("Failed to create RouteSet clientset")
-		return nil, err
-	}
-	return rClient, nil
-}
-
 // NewRoutes returns an implementation of RoutesProvider
 func NewRoutes(clusterNS string, kcfg *rest.Config, ownerRef metav1.OwnerReference) (RoutesProvider, error) {
-	routeClient, err := GetRouteSetClient(kcfg)
+	routeManager, err := route.GetRouteManager(true, kcfg, clusterNS, ownerRef)
 	if err != nil {
 		return nil, err
 	}
 
-	ownerRefs := []metav1.OwnerReference{
-		ownerRef,
-	}
 	return &routesProvider{
-		routeClient: routeClient,
-		namespace:   clusterNS,
-		nodeMap:     make(map[string]*v1.Node),
-		ownerRefs:   ownerRefs,
+		routeManager: routeManager,
+		nodeMap:      make(map[string]*v1.Node),
 	}, nil
 }
 
@@ -111,46 +68,16 @@ func NewRoutes(clusterNS string, kcfg *rest.Config, ownerRef metav1.OwnerReferen
 func (r *routesProvider) ListRoutes(ctx context.Context, clusterName string) ([]*cloudprovider.Route, error) {
 	klog.V(6).Infof("Attempting to list Routes for cluster %s", clusterName)
 
-	// use labelSelector to filter RouteSet CRs that belong to this cluster
-	labelSelector := metav1.LabelSelector{
-		MatchLabels: map[string]string{LabelKeyClusterName: clusterName},
-	}
-	routeSets, err := r.routeClient.NsxV1alpha1().RouteSets(r.namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: labels.Set(labelSelector.MatchLabels).String(),
-	})
+	routes, err := r.routeManager.ListRoutes(ctx, clusterName)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return []*cloudprovider.Route{}, nil
 		}
-		klog.ErrorS(ErrListRouteSet, fmt.Sprintf("%v", err))
+		klog.ErrorS(routecommon.ErrListRouteSet, fmt.Sprintf("%v", err))
 		return nil, err
 	}
-	if len(routeSets.Items) == 0 {
-		return []*cloudprovider.Route{}, nil
-	}
-	return r.createCPRoutes(routeSets), nil
-}
 
-// createCPRoutes creates cloudprovider Routes based on RouteSet CR
-func (r *routesProvider) createCPRoutes(routeSets *v1alpha1.RouteSetList) []*cloudprovider.Route {
-	var routes []*cloudprovider.Route
-	for _, routeSet := range routeSets.Items {
-		// only return cloudprovider.Route if RouteSet CR status 'Ready' is true
-		condition := GetRouteSetCondition(&(routeSet.Status), v1alpha1.RouteSetConditionTypeReady)
-		if condition != nil && condition.Status == v1.ConditionTrue {
-			// one RouteSet per node, so we can use nodeName as the name of RouteSet CR
-			nodeName := routeSet.Name
-			for _, route := range routeSet.Spec.Routes {
-				cpRoute := &cloudprovider.Route{
-					Name:            route.Name,
-					TargetNode:      types.NodeName(nodeName),
-					DestinationCIDR: route.Destination,
-				}
-				routes = append(routes, cpRoute)
-			}
-		}
-	}
-	return routes
+	return r.routeManager.CreateCPRoutes(routes)
 }
 
 // CreateRoute implements Routes.CreateRoute
@@ -165,82 +92,27 @@ func (r *routesProvider) CreateRoute(ctx context.Context, clusterName string, na
 		return err
 	}
 
-	routeSet, err := r.createRouteSetCR(ctx, clusterName, nameHint, nodeName, route.DestinationCIDR, nodeIP)
+	_, err = r.routeManager.CreateRouteSetCR(ctx, clusterName, nameHint, nodeName, route.DestinationCIDR, nodeIP)
 	if err != nil {
 		klog.Errorf("creating RouteSet CR for node %s failed: %s", nodeName, err)
 		return err
 	}
-	// check realized state of static routes
-	return r.checkStaticRouteRealizedState(routeSet.Name)
-}
-
-// createRouteSetCR creates RouteSet CR through RouteSet client
-func (r *routesProvider) createRouteSetCR(ctx context.Context, clusterName string, nameHint string, nodeName string, cidr string, nodeIP string) (*v1alpha1.RouteSet, error) {
-	labels := map[string]string{
-		LabelKeyClusterName: clusterName,
-	}
-	nodeRef := metav1.OwnerReference{
-		APIVersion: "v1",
-		Kind:       "Node",
-		Name:       nodeName,
-		UID:        types.UID(nameHint),
-	}
-	owners := make([]metav1.OwnerReference, len(r.ownerRefs))
-	copy(owners, r.ownerRefs)
-	owners = append(owners, nodeRef)
-	route := v1alpha1.Route{
-		Name:        r.GetRouteName(nodeName, cidr, clusterName),
-		Destination: cidr,
-		Target:      nodeIP,
-	}
-	routeSetSpec := v1alpha1.RouteSetSpec{
-		Routes: []v1alpha1.Route{
-			route,
-		},
-	}
-	routeSet := &v1alpha1.RouteSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            nodeName,
-			OwnerReferences: owners,
-			Namespace:       r.namespace,
-			Labels:          labels,
-		},
-		Spec: routeSetSpec,
-	}
-
-	_, err := r.routeClient.NsxV1alpha1().RouteSets(r.namespace).Create(ctx, routeSet, metav1.CreateOptions{})
-	if err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			return routeSet, nil
-		}
-		klog.ErrorS(ErrCreateRouteSet, fmt.Sprintf("%v", err))
-		return nil, err
-	}
-
-	klog.V(6).Infof("Successfully created RouteSet CR for node %s", nodeName)
-	return routeSet, nil
+	// nodeName equals routecr  name
+	return r.checkStaticRouteRealizedState(nodeName)
 }
 
 // checkStaticRouteRealizedState checks static route realized state
 // The check happens every 1 second and the default timeout is 10 seconds
 func (r *routesProvider) checkStaticRouteRealizedState(routeSetName string) error {
-	timeout := time.After(RealizedStateTimeout)
-	ticker := time.NewTicker(RealizedStateSleepTime)
+	timeout := time.After(routecommon.RealizedStateTimeout)
+	ticker := time.NewTicker(routecommon.RealizedStateSleepTime)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-timeout:
 			return fmt.Errorf("timed out waiting for static route %s", routeSetName)
 		case <-ticker.C:
-			routeSet, err := r.routeClient.NsxV1alpha1().RouteSets(r.namespace).Get(context.Background(), routeSetName, metav1.GetOptions{})
-			if err != nil {
-				klog.ErrorS(ErrListRouteSet, fmt.Sprintf("%v", err))
-				return err
-			}
-			condition := GetRouteSetCondition(&(routeSet.Status), v1alpha1.RouteSetConditionTypeReady)
-			if condition != nil && condition.Status == v1.ConditionTrue {
-				return nil
-			}
+			r.routeManager.CheckRouteCRReady(routeSetName)
 		}
 	}
 }
@@ -250,13 +122,7 @@ func (r *routesProvider) checkStaticRouteRealizedState(routeSetName string) erro
 func (r *routesProvider) DeleteRoute(ctx context.Context, clusterName string, route *cloudprovider.Route) error {
 	routeSetName := string(route.TargetNode)
 	klog.V(6).Infof("Deleting RouteSet CR %s in cluster %s", routeSetName, clusterName)
-	return r.DeleteRouteSetCR(routeSetName)
-}
-
-// GetRouteName returns Route name as <nodeName>-<cidr>-<clusterName>
-// e.g. nodeName-100.96.0.0-24-clusterName
-func (r *routesProvider) GetRouteName(nodeName string, cidr string, clusterName string) string {
-	return strings.Replace(nodeName+"-"+cidr+"-"+clusterName, "/", "-", -1)
+	return r.routeManager.DeleteRoute(routeSetName)
 }
 
 // getNodeIPAddress gets node IP address
@@ -315,20 +181,10 @@ func (r *routesProvider) DeleteNode(node *v1.Node) {
 	klog.V(6).Infof("Deleted node %s from nodeMap", node.Name)
 	r.nodeMapLock.Unlock()
 
-	err := r.DeleteRouteSetCR(node.Name)
+	err := r.routeManager.DeleteRoute(node.Name)
 	if err != nil {
 		klog.Errorf("failed to delete RouteSet CR for node %s: %v", node.Name, err)
 	}
-}
-
-// DeleteRouteSetCR deletes corresponding RouteSet CR when there is a node deleted
-func (r *routesProvider) DeleteRouteSetCR(nodeName string) error {
-	if err := r.routeClient.NsxV1alpha1().RouteSets(r.namespace).Delete(context.Background(), nodeName, metav1.DeleteOptions{}); err != nil {
-		klog.ErrorS(ErrDeleteRouteSet, fmt.Sprintf("%v", err))
-		return err
-	}
-	klog.V(6).Infof("Successfully deleted RouteSet CR for node %s", nodeName)
-	return nil
 }
 
 // getNode returns v1.Node from nodeMap
@@ -339,18 +195,4 @@ func (r *routesProvider) getNode(nodeName string) (*v1.Node, error) {
 		return r.nodeMap[nodeName], nil
 	}
 	return nil, fmt.Errorf("node %s not found", nodeName)
-}
-
-// GetRouteSetCondition extracts the provided condition from the given RouteSetStatus and returns that.
-// Returns nil if the condition is not present.
-func GetRouteSetCondition(status *v1alpha1.RouteSetStatus, conditionType v1alpha1.RouteSetConditionType) *v1alpha1.RouteSetCondition {
-	if status == nil {
-		return nil
-	}
-	for i := range status.Conditions {
-		if status.Conditions[i].Type == conditionType {
-			return &status.Conditions[i]
-		}
-	}
-	return nil
 }

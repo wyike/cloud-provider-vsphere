@@ -31,10 +31,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	ippoolv1alpha1 "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/apis/nsxnetworking/v1alpha1"
-	ippoolclientset "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/client/clientset/versioned"
-	ippoolscheme "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/client/clientset/versioned/scheme"
-	ippoolinformers "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/client/informers/externalversions/nsxnetworking/v1alpha1"
-	ippoollisters "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/client/listers/nsxnetworking/v1alpha1"
+	ippoolscheme "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/client/v1alpha1/clientset/versioned/scheme"
 	klog "k8s.io/klog/v2"
 )
 
@@ -47,10 +44,8 @@ const (
 
 // Controller update node's podCIDR whenever ippool's status get updated CIDR allocation result
 type Controller struct {
-	kubeclientset      kubernetes.Interface
-	ippoolclientset    ippoolclientset.Interface
-	ippoolLister       ippoollisters.IPPoolLister
-	ippoolListerSynced cache.InformerSynced
+	kubeclientset kubernetes.Interface
+	pool          IPPoolManager
 
 	recorder  record.EventRecorder
 	workqueue workqueue.RateLimitingInterface
@@ -59,8 +54,7 @@ type Controller struct {
 // NewController returns a Controller that reconciles ippool
 func NewController(
 	kubeClient kubernetes.Interface,
-	ippoolclientset ippoolclientset.Interface,
-	ippoolInformer ippoolinformers.IPPoolInformer) *Controller {
+	pool IPPoolManager) *Controller {
 
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(klog.Infof)
@@ -68,29 +62,21 @@ func NewController(
 	recorder := eventBroadcaster.NewRecorder(ippoolscheme.Scheme, corev1.EventSource{Component: controllerName})
 
 	c := &Controller{
-		kubeclientset:      kubeClient,
-		ippoolclientset:    ippoolclientset,
-		ippoolLister:       ippoolInformer.Lister(),
-		ippoolListerSynced: ippoolInformer.Informer().HasSynced,
+		kubeclientset: kubeClient,
+		pool:          pool,
 
 		recorder:  recorder,
 		workqueue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "IPPools"),
 	}
 
 	// watch ippool change
-	ippoolInformer.Informer().AddEventHandlerWithResyncPeriod(
+	pool.GetIppoolinformer().AddEventHandlerWithResyncPeriod(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: c.enqueueIPPool,
 			UpdateFunc: func(old, cur interface{}) {
-				oldIPPool, ok := old.(*ippoolv1alpha1.IPPool)
-				if !ok {
-					return
-				}
-				curIPPool, ok := cur.(*ippoolv1alpha1.IPPool)
-				if !ok {
-					return
-				}
-				if !shouldSyncIPPool(oldIPPool, curIPPool) {
+				// ask cluster api here to see if any good way besides providing two functions-only comparing status.subnets
+				// ask cluster api
+				if !pool.CheckIPPoolSubnets(old, cur) {
 					return
 				}
 				c.enqueueIPPool(cur)
@@ -125,7 +111,7 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 
 	klog.V(4).Info("Waiting cache to be synced.")
 
-	if !cache.WaitForNamedCacheSync("ippool", stopCh, c.ippoolListerSynced) {
+	if !cache.WaitForNamedCacheSync("ippool", stopCh, c.pool.GetippoolListerSynced()) {
 		return
 	}
 
@@ -194,29 +180,21 @@ func (c *Controller) syncIPPool(key string) error {
 		klog.V(4).Infof("Finished syncing service %q (%v)", key, time.Since(startTime))
 	}()
 
-	namespace, name, err := cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		return err
-	}
-
-	ippool, err := c.ippoolLister.IPPools(namespace).Get(name)
+	ippool, err := c.pool.GetIPPoolFromIndexer(key)
 	switch {
 	case err != nil:
 		utilruntime.HandleError(fmt.Errorf("unable to retrieve service %v from store: %v", key, err))
 	default:
-		err = c.processIPPoolCreateOrUpdate(ippool)
+		subs, _ := c.pool.GetIPPoolSubnet(ippool)
+		err = c.processIPPoolCreateOrUpdate(subs)
 	}
 
 	return err
 }
 
-func (c *Controller) processIPPoolCreateOrUpdate(ippool *ippoolv1alpha1.IPPool) error {
+func (c *Controller) processIPPoolCreateOrUpdate(subnets map[string]string) error {
 	ctx := context.Background()
-	// make map of allocated subnets
-	subs := make(map[string]string)
-	for _, sub := range ippool.Status.Subnets {
-		subs[sub.Name] = sub.CIDR
-	}
+
 	nodes, err := c.kubeclientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return err
@@ -224,7 +202,7 @@ func (c *Controller) processIPPoolCreateOrUpdate(ippool *ippoolv1alpha1.IPPool) 
 
 	// update node with allocated subnet
 	for _, n := range nodes.Items {
-		if v, ok := subs[n.Name]; ok {
+		if v, ok := subnets[n.Name]; ok {
 			// Set or overwrite the podCIDR on current node
 			if err := c.patchNodeCIDRWithRetry(types.NodeName(n.Name), v); err == nil {
 				// continue to next node if this one succeeded

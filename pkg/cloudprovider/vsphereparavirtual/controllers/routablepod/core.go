@@ -16,23 +16,12 @@ package routablepod
 import (
 	"context"
 	"fmt"
-	"time"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
-	ippoolclientset "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/client/clientset/versioned"
-	ippoolscheme "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/client/clientset/versioned/scheme"
-	ippoolinformers "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/client/informers/externalversions"
 	"k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/controllers/routablepod/ippool"
 	"k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/controllers/routablepod/node"
 	k8s "k8s.io/cloud-provider-vsphere/pkg/common/kubernetes"
-)
-
-const (
-	defaultResyncTime time.Duration = time.Minute * 1
 )
 
 // StartControllers starts ippool_controller and node_controller
@@ -43,25 +32,17 @@ func StartControllers(scCfg *rest.Config, client kubernetes.Interface, informerM
 	if clusterNS == "" {
 		return fmt.Errorf("cluster namespace can't be empty")
 	}
-	ipcs, err := ippoolclientset.NewForConfig(scCfg)
+	pool, err := ippool.GetIPPoolManager(false, scCfg, clusterNS)
 	if err != nil {
-		return fmt.Errorf("error building ippool clientset: %w", err)
+		return fmt.Errorf("fail to get ippool manager")
 	}
 
-	s := scheme.Scheme
-	if err := ippoolscheme.AddToScheme(s); err != nil {
-		return fmt.Errorf("failed to register ippoolSchemes")
-	}
-
-	ippoolInformerFactory := ippoolinformers.NewSharedInformerFactoryWithOptions(ipcs, defaultResyncTime, ippoolinformers.WithNamespace(clusterNS))
-	ippoolInformer := ippoolInformerFactory.Nsx().V1alpha1().IPPools()
-
-	ippoolController := ippool.NewController(client, ipcs, ippoolInformer)
+	ippoolController := ippool.NewController(client, pool)
 	go ippoolController.Run(context.Background().Done())
 
-	ippoolInformerFactory.Start(wait.NeverStop)
+	pool.StartIppoolInformer()
 
-	nodeController := node.NewController(client, ipcs, informerManager, clusterName, clusterNS, ownerRef)
+	nodeController := node.NewController(client, pool, informerManager, clusterName, clusterNS, ownerRef)
 	go nodeController.Run(context.Background().Done())
 
 	return nil

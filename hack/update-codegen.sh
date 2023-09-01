@@ -20,14 +20,22 @@ set -o pipefail
 
 # SCRIPT_ROOT: the directory in which this script is located
 SCRIPT_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
+echo $SCRIPT_ROOT
+ls $SCRIPT_ROOT
+#go get github.com/nomad-software/vend
+#vend
+#chmod 755 vendor/k8s.io/code-generator/generate-groups.sh
+
 # CODEGEN_PKG: the codegen package which we use to generate client code
 CODEGEN_PKG=${CODEGEN_PKG:-$(cd "${SCRIPT_ROOT}"; ls -d -1 ./vendor/k8s.io/code-generator 2>/dev/null || echo ../code-generator)}
 # ROOT_DIR: the root directory in which the apis are defined
-ROOT_DIR="k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual"
+MODULE="k8s.io/cloud-provider-vsphere"
+BASE_DIR="pkg/cloudprovider/vsphereparavirtual"
 # CUSTOM_RESOURCE_PACKAGE: the name of the custom resource package that we are generating client code for
 CUSTOM_RESOURCE_PACKAGE="nsxnetworking"
 # CUSTOM_RESOURCE_VERSION: the version of the resource
-CUSTOM_RESOURCE_VERSION="v1alpha1"
+CUSTOM_RESOURCE_VERSION_1="v1alpha1"
+CUSTOM_RESOURCE_VERSION_2="v1alpha2"
 
 # emojis to make nice output
 printf "\xF0\x9F\x94\x8D\n"
@@ -38,7 +46,18 @@ printf "\xF0\x9F\x94\x8D\n"
 #                  instead of the $GOPATH directly. For normal projects this can be dropped.
 # This generates deepcopy, client, informer and lister for the resource package
 bash "${CODEGEN_PKG}"/generate-groups.sh all \
-  "${ROOT_DIR}"/client "${ROOT_DIR}"/apis \
-  "$CUSTOM_RESOURCE_PACKAGE:$CUSTOM_RESOURCE_VERSION" \
-  --output-base "$(dirname "${BASH_SOURCE[0]}")/../../.." \
+  "${MODULE}"/"${BASE_DIR}"/client/"${CUSTOM_RESOURCE_VERSION_1}" "${MODULE}"/"${BASE_DIR}"/apis \
+  "$CUSTOM_RESOURCE_PACKAGE:$CUSTOM_RESOURCE_VERSION_1,$CUSTOM_RESOURCE_VERSION_2" \
+  --output-base "${SCRIPT_ROOT}" \
   --go-header-file "${SCRIPT_ROOT}"/hack/boilerplate.go.txt
+
+#bash "${CODEGEN_PKG}"/generate-groups.sh all \
+#  "${MODULE}"/"${BASE_DIR}"/client/"${CUSTOM_RESOURCE_VERSION_2}" "${MODULE}"/"${BASE_DIR}"/apis \
+#  "$CUSTOM_RESOURCE_PACKAGE:$CUSTOM_RESOURCE_VERSION_2" \
+#  --output-base "${SCRIPT_ROOT}" \
+#  --go-header-file "${SCRIPT_ROOT}"/hack/boilerplate.go.txt
+
+cp -r "${SCRIPT_ROOT}"/"${MODULE}"/"${BASE_DIR}"/* "${BASE_DIR}"
+rm -rf "${SCRIPT_ROOT}"/k8s.io
+
+#rm -rf vendor

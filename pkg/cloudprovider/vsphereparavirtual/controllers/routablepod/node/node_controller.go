@@ -14,7 +14,6 @@ limitations under the License.
 package node
 
 import (
-	"context"
 	"fmt"
 	"time"
 
@@ -29,10 +28,8 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
-	ippoolv1alpha1 "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/apis/nsxnetworking/v1alpha1"
-	ippoolclientset "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/client/clientset/versioned"
-	ippoolscheme "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/client/clientset/versioned/scheme"
-	"k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/controllers/routablepod/helper"
+	ippoolscheme "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/client/v1alpha1/clientset/versioned/scheme"
+	"k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/controllers/routablepod/ippool"
 	k8s "k8s.io/cloud-provider-vsphere/pkg/common/kubernetes"
 	klog "k8s.io/klog/v2"
 )
@@ -45,7 +42,7 @@ const (
 // whenever a node is added/updated/removed.
 // Create a ippool if there isn't one for current cluster.
 type Controller struct {
-	ippoolclientset ippoolclientset.Interface
+	pool ippool.IPPoolManager
 
 	nodesLister      corelisters.NodeLister
 	nodeListerSynced cache.InformerSynced
@@ -62,7 +59,7 @@ type Controller struct {
 // NewController returns controller that reconciles node
 func NewController(
 	kubeClient kubernetes.Interface,
-	ippoolclientset ippoolclientset.Interface,
+	pool ippool.IPPoolManager,
 	informerManager *k8s.InformerManager,
 	clusterName string,
 	clusterNS string,
@@ -74,7 +71,7 @@ func NewController(
 	recorder := eventBroadcaster.NewRecorder(ippoolscheme.Scheme, corev1.EventSource{Component: controllerName})
 
 	c := &Controller{
-		ippoolclientset:  ippoolclientset,
+		pool:             pool,
 		nodesLister:      informerManager.GetNodeLister(),
 		nodeListerSynced: informerManager.IsNodeInformerSynced(),
 
@@ -217,9 +214,7 @@ func (c *Controller) syncNode(key string) error {
 // remove the node subnet allocation request from ippool's spec
 // if ippool is not found, skip the removing
 func (c *Controller) processNodeDelete(name string) error {
-	ctx := context.Background()
-
-	ippool, err := c.ippoolclientset.NsxV1alpha1().IPPools(c.clusterNS).Get(ctx, helper.IppoolNameFromClusterName(c.clusterName), metav1.GetOptions{})
+	pool, err := c.pool.GetIPPool(c.clusterNS, c.clusterName)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			klog.V(4).Info("ippool is gone, no need to remove the node request")
@@ -228,83 +223,32 @@ func (c *Controller) processNodeDelete(name string) error {
 		return err
 	}
 
-	newSubnets := []ippoolv1alpha1.SubnetRequest{}
-	for _, sub := range ippool.Spec.Subnets {
-		if sub.Name == name {
-			continue
-		}
-		newSubnets = append(newSubnets, sub)
-	}
-	ippool.Spec.Subnets = newSubnets
-
-	_, err = c.ippoolclientset.NsxV1alpha1().IPPools(c.clusterNS).Update(context.TODO(), ippool, metav1.UpdateOptions{})
-
-	return err
+	// node name is same with its corresponding subnet name
+	_, err = c.pool.DeleteSubnetFromIPPool(name, pool)
+	//wrap the error
+	return fmt.Errorf("Fail to remove node subnet from ipppol, err: %v", err)
 }
 
 // when a node is created or updated, check if the node has podCIDR field set.
 // if node's podCIDR is empty, add the node CIDR allocation request to ippool spec.
 func (c *Controller) processNodeCreateOrUpdate(node *corev1.Node) error {
-	ctx := context.Background()
-	ippool, err := c.ippoolclientset.NsxV1alpha1().IPPools(c.clusterNS).Get(ctx, helper.IppoolNameFromClusterName(c.clusterName), metav1.GetOptions{})
+	pool, err := c.pool.GetIPPool(c.clusterNS, c.clusterName)
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
 			return err
 		}
 		// if ippool does not exist, create one
 		klog.V(4).Info("creating ippool")
-		if ippool, err = c.createIPPool(); err != nil {
+		if pool, err = c.pool.CreateIPPool(c.clusterNS, c.clusterName, c.ownerRef); err != nil {
 			klog.Error("error creating ippool")
 			return err
 		}
 	}
 
-	// skip if the request already added
-	for _, sub := range ippool.Spec.Subnets {
-		if sub.Name == node.Name {
-			klog.V(4).Info("node %s already requested the ip", node.Name)
-			return nil
-		}
-	}
+	klog.V(4).Info("updating CIDR allocation request in IPPool for node %s", node.Name)
 
-	klog.V(4).Info("updating CIDR request in IPPool %s/%s for node %s", ippool.Namespace, ippool.Name, node.Name)
+	c.pool.AddSubnetToIPPool(node, pool, c.ownerRef)
 
-	newIPPool := ippool.DeepCopy()
-	// add node cidr allocation req to the ippool spec only when node doesn't contain pod cidr
-	if node.Spec.PodCIDR == "" || len(node.Spec.PodCIDRs) == 0 {
-		newIPPool.Spec.Subnets = append(newIPPool.Spec.Subnets, ippoolv1alpha1.SubnetRequest{
-			Name:         node.Name,
-			IPFamily:     helper.IPFamilyDefault,
-			PrefixLength: helper.PrefixLengthDefault,
-		})
-	}
-
-	if newIPPool.OwnerReferences == nil {
-		newIPPool.OwnerReferences = []metav1.OwnerReference{*c.ownerRef}
-	}
-
-	_, err = c.ippoolclientset.NsxV1alpha1().IPPools(c.clusterNS).Update(context.Background(), newIPPool, metav1.UpdateOptions{})
-	if err != nil {
-		return err
-	}
-
-	klog.V(4).Info("updated CIDR in IPPool %s/%s for node %s", ippool.Namespace, ippool.Name, node.Name)
+	klog.V(4).Info("updated CIDR allocation in IPPool for node %s", node.Name)
 	return nil
-}
-
-func (c *Controller) createIPPool() (*ippoolv1alpha1.IPPool, error) {
-	ippool := &ippoolv1alpha1.IPPool{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      helper.IppoolNameFromClusterName(c.clusterName),
-			Namespace: c.clusterNS,
-			OwnerReferences: []metav1.OwnerReference{
-				*c.ownerRef,
-			},
-		},
-		Spec: ippoolv1alpha1.IPPoolSpec{
-			Subnets: []ippoolv1alpha1.SubnetRequest{},
-		},
-	}
-
-	return c.ippoolclientset.NsxV1alpha1().IPPools(c.clusterNS).Create(context.Background(), ippool, metav1.CreateOptions{})
 }
