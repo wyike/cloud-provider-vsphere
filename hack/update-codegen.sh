@@ -45,8 +45,8 @@ printf "\xF0\x9F\x94\x8D\n"
 #                  k8s.io/kubernetes. The output-base is needed for the generators to output into the vendor dir
 #                  instead of the $GOPATH directly. For normal projects this can be dropped.
 # This generates deepcopy, client, informer and lister for the resource package
-bash "${CODEGEN_PKG}"/generate-groups.sh all \
-  "${MODULE}"/"${BASE_DIR}"/client/"${CUSTOM_RESOURCE_VERSION_1}" "${MODULE}"/"${BASE_DIR}"/apis \
+bash "${CODEGEN_PKG}"/generate-groups.sh applyconfiguration,client,deepcopy,informer,lister \
+  "${MODULE}"/"${BASE_DIR}"/client "${MODULE}"/"${BASE_DIR}"/apis \
   "$CUSTOM_RESOURCE_PACKAGE:$CUSTOM_RESOURCE_VERSION_1,$CUSTOM_RESOURCE_VERSION_2" \
   --output-base "${SCRIPT_ROOT}" \
   --go-header-file "${SCRIPT_ROOT}"/hack/boilerplate.go.txt
